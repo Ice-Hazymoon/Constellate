@@ -1,0 +1,885 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import math
+from copy import deepcopy
+from itertools import pairwise
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from astropy.wcs import WCS
+from PIL import Image, ImageDraw, ImageFont
+
+from annotate_geometry import (
+    build_segment_key,
+    clip_segment_to_bounds,
+    crop_bounds,
+    is_point_inside_crop,
+    is_point_visible,
+    is_projected_segment_duplicate,
+    point_distance_squared,
+    project_points,
+    segment_intersects_crop,
+)
+from annotate_localization import normalize_lookup_key
+from annotate_options import overlay_detail_value, overlay_layer_enabled
+from annotate_types import CropCandidate
+
+
+try:
+    LANCZOS_RESAMPLING = Image.Resampling.LANCZOS
+except AttributeError:  # pragma: no cover - Pillow compatibility
+    LANCZOS_RESAMPLING = Image.LANCZOS
+
+
+def load_font(size: int) -> ImageFont.ImageFont:
+    candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+    ]
+    for candidate in candidates:
+        path = Path(candidate)
+        if not path.exists():
+            continue
+        try:
+            return ImageFont.truetype(str(path), size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def clamp_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    x: float,
+    y: float,
+    image_width: int,
+    image_height: int,
+    font: ImageFont.ImageFont,
+    stroke_width: int = 2,
+    bounds: tuple[float, float, float, float] | None = None,
+) -> tuple[float, float]:
+    left, top, right, bottom = draw.textbbox((x, y), text, font=font, stroke_width=stroke_width)
+    width = right - left
+    height = bottom - top
+    if bounds is None:
+        min_x = 2.0
+        max_x = image_width - width - 2.0
+        min_y = 2.0
+        max_y = image_height - height - 2.0
+    else:
+        min_x = bounds[0] + 2.0
+        max_x = bounds[1] - width - 2.0
+        min_y = bounds[2] + 2.0
+        max_y = bounds[3] - height - 2.0
+    clamped_x = min(max(min_x, x), max(min_x, max_x))
+    clamped_y = min(max(min_y, y), max(min_y, max_y))
+    return clamped_x, clamped_y
+
+
+def boxes_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float], padding: float = 6.0) -> bool:
+    return not (a[2] + padding < b[0] or b[2] + padding < a[0] or a[3] + padding < b[1] or b[3] + padding < a[1])
+
+
+def place_label(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    anchor_x: float,
+    anchor_y: float,
+    image_width: int,
+    image_height: int,
+    font: ImageFont.ImageFont,
+    occupied_boxes: list[tuple[float, float, float, float]],
+    offsets: list[tuple[float, float]],
+    stroke_width: int = 2,
+    bounds: tuple[float, float, float, float] | None = None,
+) -> tuple[float, float] | None:
+    for dx, dy in offsets:
+        x_value, y_value = clamp_text(
+            draw,
+            text,
+            anchor_x + dx,
+            anchor_y + dy,
+            image_width,
+            image_height,
+            font,
+            stroke_width=stroke_width,
+            bounds=bounds,
+        )
+        bbox = draw.textbbox((x_value, y_value), text, font=font, stroke_width=stroke_width)
+        normalized_box = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        if any(boxes_overlap(normalized_box, existing) for existing in occupied_boxes):
+            continue
+        occupied_boxes.append(normalized_box)
+        return x_value, y_value
+    return None
+
+
+def dso_category(item: dict[str, Any]) -> str:
+    normalized_type = normalize_lookup_key(item.get("type"))
+    if normalized_type in {"ocl", "opencluster"}:
+        return "open_cluster"
+    if normalized_type in {"gcl", "globularcluster"}:
+        return "globular_cluster"
+    if normalized_type in {"pn", "planetarynebula"}:
+        return "planetary_nebula"
+    if normalized_type in {"snr", "supernovaremnant"}:
+        return "supernova_remnant"
+    if normalized_type in {"neb", "diffusenebula", "emissionnebula", "reflectionnebula", "hii", "cln", "gneb", "rfn"}:
+        return "diffuse_nebula"
+    if normalized_type in {"g", "galaxy", "spiralgalaxy", "ellipticalgalaxy", "lenticulargalaxy", "irregulargalaxy", "ultrafaintdwarfgalaxy"}:
+        return "galaxy"
+    return "other"
+
+
+def dso_style(item: dict[str, Any]) -> tuple[str, tuple[int, int, int, int]]:
+    category = dso_category(item)
+    styles = {
+        "open_cluster": ("square", (145, 228, 255, 235)),
+        "globular_cluster": ("crossed_circle", (160, 245, 198, 235)),
+        "planetary_nebula": ("ring", (116, 220, 255, 235)),
+        "supernova_remnant": ("x_circle", (255, 178, 138, 235)),
+        "diffuse_nebula": ("hexagon", (118, 202, 255, 235)),
+        "galaxy": ("diamond", (214, 206, 255, 235)),
+        "other": ("circle", (140, 235, 255, 230)),
+    }
+    return styles[category]
+
+
+def compute_label_leader_segment(
+    draw: ImageDraw.ImageDraw,
+    anchor_x: float,
+    anchor_y: float,
+    label_position: tuple[float, float],
+    text: str,
+    font: ImageFont.ImageFont,
+    stroke_width: int = 2,
+) -> tuple[float, float, float, float] | None:
+    bbox = draw.textbbox(label_position, text, font=font, stroke_width=stroke_width)
+    target_x = min(max(anchor_x, bbox[0]), bbox[2])
+    target_y = min(max(anchor_y, bbox[1]), bbox[3])
+    if point_distance_squared(anchor_x, anchor_y, target_x, target_y) < 24.0**2:
+        return None
+    return float(anchor_x), float(anchor_y), float(target_x), float(target_y)
+
+
+def overlay_supersample_scale(width: int, height: int) -> int:
+    pixels = width * height
+    if pixels <= 4_000_000:
+        return 3
+    if pixels <= 12_000_000:
+        return 2
+    return 1
+
+
+def scale_crop_candidate(crop: CropCandidate, scale: int) -> CropCandidate:
+    return CropCandidate(
+        name=crop.name,
+        x=int(round(crop.x * scale)),
+        y=int(round(crop.y * scale)),
+        width=int(round(crop.width * scale)),
+        height=int(round(crop.height * scale)),
+    )
+
+
+def scale_positioned_overlay_items(items: list[dict[str, Any]], scale: int) -> list[dict[str, Any]]:
+    scaled_items = deepcopy(items)
+    for item in scaled_items:
+        if "x" in item:
+            item["x"] = float(item["x"]) * scale
+        if "y" in item:
+            item["y"] = float(item["y"]) * scale
+    return scaled_items
+
+
+def scale_constellation_overlays(constellations: list[dict[str, Any]], scale: int) -> list[dict[str, Any]]:
+    scaled_constellations = deepcopy(constellations)
+    for constellation in scaled_constellations:
+        constellation["label_x"] = float(constellation["label_x"]) * scale
+        constellation["label_y"] = float(constellation["label_y"]) * scale
+        for segment in constellation["segments"]:
+            for endpoint in ("start", "end"):
+                segment[endpoint]["x"] = float(segment[endpoint]["x"]) * scale
+                segment[endpoint]["y"] = float(segment[endpoint]["y"]) * scale
+    return scaled_constellations
+
+
+def rgba_to_list(color: tuple[int, int, int, int]) -> list[int]:
+    return [int(value) for value in color]
+
+
+def collect_named_stars(
+    catalog: pd.DataFrame,
+    star_names: dict[int, str],
+    wcs: WCS,
+    crop: CropCandidate,
+    image_width: int,
+    image_height: int,
+    overlay_options: dict[str, Any],
+) -> list[dict[str, Any]]:
+    candidate_hips = [hip for hip in star_names if hip in catalog.index]
+    if not candidate_hips:
+        return []
+
+    magnitude_limit = float(overlay_detail_value(overlay_options, "star_magnitude_limit"))
+    max_labels = int(overlay_detail_value(overlay_options, "star_label_limit"))
+    bright_star_separation = float(overlay_detail_value(overlay_options, "star_bright_separation"))
+    dim_star_separation = float(overlay_detail_value(overlay_options, "star_dim_separation"))
+
+    subset = catalog.loc[candidate_hips].copy()
+    subset = subset[subset["magnitude"] <= magnitude_limit].sort_values("magnitude")
+    x_values, y_values = project_points(
+        wcs,
+        subset["ra_degrees"].to_numpy(),
+        subset["dec_degrees"].to_numpy(),
+        crop,
+    )
+
+    visible: list[dict[str, Any]] = []
+    for (hip, row), x_value, y_value in zip(subset.iterrows(), x_values, y_values, strict=True):
+        if not (math.isfinite(x_value) and math.isfinite(y_value)):
+            continue
+        if not is_point_visible(float(x_value), float(y_value), image_width, image_height):
+            continue
+        if not is_point_inside_crop(float(x_value), float(y_value), crop, margin=12.0):
+            continue
+        visible.append(
+            {
+                "hip": int(hip),
+                "name": star_names[int(hip)],
+                "magnitude": float(row["magnitude"]),
+                "x": float(x_value),
+                "y": float(y_value),
+            }
+        )
+
+    selected: list[dict[str, Any]] = []
+    anchors: list[tuple[float, float]] = []
+    for star in visible:
+        if len(selected) >= max_labels:
+            break
+        separation = bright_star_separation if star["magnitude"] <= 2.0 else dim_star_separation
+        if any((star["x"] - px) ** 2 + (star["y"] - py) ** 2 < separation**2 for px, py in anchors):
+            continue
+        anchors.append((star["x"], star["y"]))
+        selected.append(star)
+    return selected
+
+
+def collect_constellations(
+    catalog: pd.DataFrame,
+    constellations: list[dict[str, Any]],
+    wcs: WCS,
+    crop: CropCandidate,
+    image_width: int,
+    image_height: int,
+    overlay_options: dict[str, Any],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    duplicate_tolerance = max(6.0, min(image_width, image_height) / 180.0)
+    for constellation in constellations:
+        visible_segments: list[dict[str, Any]] = []
+        label_points: list[tuple[float, float]] = []
+        onscreen_segments = 0
+        segment_keys: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+
+        for polyline in constellation.get("lines", []):
+            for start_hip, end_hip in pairwise(polyline):
+                if start_hip not in catalog.index or end_hip not in catalog.index:
+                    continue
+                start = catalog.loc[start_hip]
+                end = catalog.loc[end_hip]
+                segment_key = build_segment_key(
+                    float(start["ra_degrees"]),
+                    float(start["dec_degrees"]),
+                    float(end["ra_degrees"]),
+                    float(end["dec_degrees"]),
+                )
+                if segment_key in segment_keys:
+                    continue
+                x_values, y_values = project_points(
+                    wcs,
+                    np.array([start["ra_degrees"], end["ra_degrees"]]),
+                    np.array([start["dec_degrees"], end["dec_degrees"]]),
+                    crop,
+                )
+                start_x, end_x = float(x_values[0]), float(x_values[1])
+                start_y, end_y = float(y_values[0]), float(y_values[1])
+                if not all(math.isfinite(value) for value in (start_x, start_y, end_x, end_y)):
+                    continue
+                if not segment_intersects_crop(start_x, start_y, end_x, end_y, crop, margin=36.0):
+                    continue
+                if is_projected_segment_duplicate(visible_segments, start_x, start_y, end_x, end_y, duplicate_tolerance):
+                    continue
+
+                segment_keys.add(segment_key)
+
+                if segment_intersects_crop(start_x, start_y, end_x, end_y, crop):
+                    onscreen_segments += 1
+
+                visible_segments.append(
+                    {
+                        "start": {"x": start_x, "y": start_y, "hip": int(start_hip)},
+                        "end": {"x": end_x, "y": end_y, "hip": int(end_hip)},
+                    }
+                )
+
+                if is_point_inside_crop(start_x, start_y, crop):
+                    label_points.append((start_x, start_y))
+                if is_point_inside_crop(end_x, end_y, crop):
+                    label_points.append((end_x, end_y))
+
+        for polyline in constellation.get("coord_lines", []):
+            ra_values = np.array([point["ra_degrees"] for point in polyline])
+            dec_values = np.array([point["dec_degrees"] for point in polyline])
+            x_values, y_values = project_points(wcs, ra_values, dec_values, crop)
+            projected_points = list(zip(polyline, x_values, y_values, strict=True))
+            for (start_point, start_x_raw, start_y_raw), (end_point, end_x_raw, end_y_raw) in pairwise(projected_points):
+                start_x = float(start_x_raw)
+                start_y = float(start_y_raw)
+                end_x = float(end_x_raw)
+                end_y = float(end_y_raw)
+                if not all(math.isfinite(value) for value in (start_x, start_y, end_x, end_y)):
+                    continue
+
+                segment_key = build_segment_key(
+                    float(start_point["ra_degrees"]),
+                    float(start_point["dec_degrees"]),
+                    float(end_point["ra_degrees"]),
+                    float(end_point["dec_degrees"]),
+                )
+                if segment_key in segment_keys:
+                    continue
+                if not segment_intersects_crop(start_x, start_y, end_x, end_y, crop, margin=36.0):
+                    continue
+                if is_projected_segment_duplicate(visible_segments, start_x, start_y, end_x, end_y, duplicate_tolerance):
+                    continue
+
+                segment_keys.add(segment_key)
+                if segment_intersects_crop(start_x, start_y, end_x, end_y, crop):
+                    onscreen_segments += 1
+
+                visible_segments.append(
+                    {
+                        "start": {"x": start_x, "y": start_y},
+                        "end": {"x": end_x, "y": end_y},
+                    }
+                )
+
+                if is_point_inside_crop(start_x, start_y, crop):
+                    label_points.append((start_x, start_y))
+                if is_point_inside_crop(end_x, end_y, crop):
+                    label_points.append((end_x, end_y))
+
+        if not visible_segments:
+            continue
+        if len(label_points) < 2 and onscreen_segments == 0:
+            continue
+
+        if constellation.get("label_ra_degrees") is not None and constellation.get("label_dec_degrees") is not None:
+            label_x_values, label_y_values = project_points(
+                wcs,
+                np.array([constellation["label_ra_degrees"]]),
+                np.array([constellation["label_dec_degrees"]]),
+                crop,
+            )
+            explicit_label_x = float(label_x_values[0])
+            explicit_label_y = float(label_y_values[0])
+            if math.isfinite(explicit_label_x) and math.isfinite(explicit_label_y) and is_point_visible(
+                explicit_label_x,
+                explicit_label_y,
+                image_width,
+                image_height,
+                margin=48.0,
+            ):
+                if is_point_inside_crop(explicit_label_x, explicit_label_y, crop, margin=48.0):
+                    label_x = explicit_label_x
+                    label_y = explicit_label_y
+                elif label_points:
+                    label_x = sum(point[0] for point in label_points) / len(label_points)
+                    label_y = sum(point[1] for point in label_points) / len(label_points)
+                else:
+                    first_segment = visible_segments[0]
+                    label_x = (first_segment["start"]["x"] + first_segment["end"]["x"]) / 2.0
+                    label_y = (first_segment["start"]["y"] + first_segment["end"]["y"]) / 2.0
+            elif label_points:
+                label_x = sum(point[0] for point in label_points) / len(label_points)
+                label_y = sum(point[1] for point in label_points) / len(label_points)
+            else:
+                first_segment = visible_segments[0]
+                label_x = (first_segment["start"]["x"] + first_segment["end"]["x"]) / 2.0
+                label_y = (first_segment["start"]["y"] + first_segment["end"]["y"]) / 2.0
+        elif label_points:
+            label_x = sum(point[0] for point in label_points) / len(label_points)
+            label_y = sum(point[1] for point in label_points) / len(label_points)
+        else:
+            first_segment = visible_segments[0]
+            label_x = (first_segment["start"]["x"] + first_segment["end"]["x"]) / 2.0
+            label_y = (first_segment["start"]["y"] + first_segment["end"]["y"]) / 2.0
+
+        result.append(
+            {
+                "abbr": constellation["abbr"],
+                "english_name": constellation["english_name"],
+                "native_name": constellation["native_name"],
+                "display_name": constellation["display_name"],
+                "label_x": float(label_x),
+                "label_y": float(label_y),
+                "segments": visible_segments,
+                "show_label": False,
+            }
+        )
+
+    if bool(overlay_detail_value(overlay_options, "show_all_constellation_labels")):
+        for constellation in result:
+            constellation["show_label"] = True
+    else:
+        anchors: list[tuple[float, float]] = []
+        for constellation in sorted(result, key=lambda item: len(item["segments"]), reverse=True):
+            if any((constellation["label_x"] - px) ** 2 + (constellation["label_y"] - py) ** 2 < 72.0**2 for px, py in anchors):
+                continue
+            anchors.append((constellation["label_x"], constellation["label_y"]))
+            constellation["show_label"] = True
+
+    return sorted(result, key=lambda item: len(item["segments"]), reverse=True)
+
+
+def is_interesting_dso(item: dict[str, Any], overlay_options: dict[str, Any]) -> bool:
+    object_type = item["type"]
+    if object_type.startswith("*") or object_type in {"Dup", "NonEx", "Other"}:
+        return False
+    if item["common_name"] in {"Alnilam", "Orion B", "Gem A", "Browning", "Flame Nebula", "Great Bird Cluster", "Lower Sword", "Upper Sword"}:
+        return False
+    if item["messier"] or item["common_name"]:
+        return True
+    if normalize_lookup_key(item.get("label")) not in {
+        normalize_lookup_key(item.get("name")),
+        normalize_lookup_key(item.get("catalog_id")),
+    }:
+        return True
+    if bool(overlay_detail_value(overlay_options, "include_catalog_dsos")) and item.get("catalog_id"):
+        return True
+    return False
+
+
+def dso_importance(item: dict[str, Any]) -> float:
+    score = 0.0
+    if item.get("curated"):
+        score += 4.0
+    if item["messier"]:
+        score += 8.0
+    if item["common_name"]:
+        score += 5.0
+    if normalize_lookup_key(item.get("label")) not in {
+        normalize_lookup_key(item.get("name")),
+        normalize_lookup_key(item.get("messier")),
+        normalize_lookup_key(item.get("common_name")),
+        normalize_lookup_key(item.get("catalog_id")),
+    }:
+        score += 2.5
+    if item["major_axis_arcmin"] is not None:
+        score += min(item["major_axis_arcmin"], 180.0) / 30.0
+    if item["magnitude"] is not None:
+        score += max(0.0, 10.5 - item["magnitude"]) / 2.5
+    return score
+
+
+def compose_dso_display_label(item: dict[str, Any]) -> str:
+    base_label = item.get("label") or item.get("name") or ""
+    messier = item.get("messier")
+    catalog_id = item.get("catalog_id")
+
+    if messier and normalize_lookup_key(base_label) != normalize_lookup_key(messier):
+        return f"{messier} {base_label}"
+    if messier:
+        return messier
+    if catalog_id and catalog_id.upper().startswith(("NGC", "IC")) and normalize_lookup_key(base_label) != normalize_lookup_key(catalog_id):
+        return f"{catalog_id} {base_label}"
+    return base_label
+
+
+def collect_deep_sky_objects(
+    deep_sky_objects: list[dict[str, Any]],
+    wcs: WCS,
+    crop: CropCandidate,
+    image_width: int,
+    image_height: int,
+    overlay_options: dict[str, Any],
+) -> list[dict[str, Any]]:
+    dso_magnitude_limit = float(overlay_detail_value(overlay_options, "dso_magnitude_limit"))
+    dso_label_limit = int(overlay_detail_value(overlay_options, "dso_label_limit"))
+    dso_spacing_scale = float(overlay_detail_value(overlay_options, "dso_spacing_scale"))
+    detailed_labels = bool(overlay_detail_value(overlay_options, "detailed_dso_labels"))
+
+    candidates: list[dict[str, Any]] = []
+    for item in deep_sky_objects:
+        if not is_interesting_dso(item, overlay_options):
+            continue
+        if item["magnitude"] is not None and item["magnitude"] > dso_magnitude_limit and not item["messier"] and not item["common_name"]:
+            continue
+        x_values, y_values = project_points(
+            wcs,
+            np.array([item["ra_degrees"]]),
+            np.array([item["dec_degrees"]]),
+            crop,
+        )
+        x_value = float(x_values[0])
+        y_value = float(y_values[0])
+        if not (math.isfinite(x_value) and math.isfinite(y_value)):
+            continue
+        if not is_point_visible(x_value, y_value, image_width, image_height, margin=28.0):
+            continue
+        if not is_point_inside_crop(x_value, y_value, crop, margin=28.0):
+            continue
+        candidate = dict(item)
+        candidate.update(
+            {
+                "x": x_value,
+                "y": y_value,
+                "display_label": compose_dso_display_label(item) if detailed_labels else (item.get("label") or item.get("name") or ""),
+            }
+        )
+        candidates.append(candidate)
+
+    selected: list[dict[str, Any]] = []
+    anchors: list[tuple[float, float]] = []
+    labels: list[tuple[str, float, float]] = []
+    for item in sorted(
+        candidates,
+        key=lambda entry: (-dso_importance(entry), entry["magnitude"] if entry["magnitude"] is not None else 99.0, -(entry["major_axis_arcmin"] or 0.0)),
+    ):
+        if len(selected) >= dso_label_limit:
+            break
+        spacing = max(34.0, min(104.0, (item["major_axis_arcmin"] or 28.0) * dso_spacing_scale))
+        if any((item["x"] - px) ** 2 + (item["y"] - py) ** 2 < spacing**2 for px, py in anchors):
+            continue
+        if any(label == item["display_label"] and (item["x"] - px) ** 2 + (item["y"] - py) ** 2 < 180.0**2 for label, px, py in labels):
+            continue
+        anchors.append((item["x"], item["y"]))
+        labels.append((item["display_label"], item["x"], item["y"]))
+        selected.append(item)
+    return selected
+
+
+def add_contextual_constellation_labels(
+    constellations: list[dict[str, Any]],
+    deep_sky_objects: list[dict[str, Any]],
+    constellation_catalog: dict[str, dict[str, Any]],
+    overlay_options: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not overlay_layer_enabled(overlay_options, "contextual_constellation_labels"):
+        return constellations
+    known_abbrs = {item["abbr"] for item in constellations}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in deep_sky_objects:
+        abbr = (item.get("const") or "").strip()
+        if not abbr or abbr in known_abbrs or abbr not in constellation_catalog:
+            continue
+        grouped.setdefault(abbr, []).append(item)
+
+    extras: list[dict[str, Any]] = []
+    for abbr, items in grouped.items():
+        reference = constellation_catalog[abbr]
+        label_x = sum(item["x"] for item in items) / len(items)
+        label_y = sum(item["y"] for item in items) / len(items)
+        extras.append(
+            {
+                "abbr": abbr,
+                "english_name": reference["english_name"],
+                "native_name": reference["native_name"],
+                "display_name": reference["display_name"],
+                "label_x": float(label_x),
+                "label_y": float(label_y),
+                "segments": [],
+                "show_label": True,
+            }
+        )
+    return [*constellations, *extras]
+
+
+def build_overlay_scene(
+    image_size: tuple[int, int],
+    constellations: list[dict[str, Any]],
+    named_stars: list[dict[str, Any]],
+    deep_sky_objects: list[dict[str, Any]],
+    crop: CropCandidate,
+    overlay_options: dict[str, Any],
+) -> dict[str, Any]:
+    image_width, image_height = image_size
+    layout_surface = Image.new("RGBA", image_size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layout_surface)
+    occupied_boxes: list[tuple[float, float, float, float]] = []
+
+    min_dimension = min(image_width, image_height)
+    line_width = max(1, min_dimension // 600)
+    render_bounds = crop_bounds(crop)
+
+    constellation_font_size = max(18, min_dimension // 52)
+    dso_font_size = max(14, min_dimension // 74)
+    star_font_size = max(12, min_dimension // 84)
+    constellation_font = load_font(constellation_font_size)
+    dso_font = load_font(dso_font_size)
+    star_font = load_font(star_font_size)
+    dso_radius = max(4, min_dimension // 250)
+    star_radius = max(2, min_dimension // 320)
+
+    show_dso_markers = overlay_layer_enabled(overlay_options, "deep_sky_markers")
+    show_dso_labels = overlay_layer_enabled(overlay_options, "deep_sky_labels")
+    show_constellation_labels = overlay_layer_enabled(overlay_options, "constellation_labels")
+    show_contextual_labels = overlay_layer_enabled(overlay_options, "contextual_constellation_labels")
+    show_star_markers = overlay_layer_enabled(overlay_options, "star_markers")
+    show_star_labels = overlay_layer_enabled(overlay_options, "star_labels")
+    show_label_leaders = overlay_layer_enabled(overlay_options, "label_leaders")
+
+    scene: dict[str, Any] = {
+        "image_width": image_width,
+        "image_height": image_height,
+        "crop": {
+            "name": crop.name,
+            "x": crop.x,
+            "y": crop.y,
+            "width": crop.width,
+            "height": crop.height,
+        },
+        "bounds": {
+            "left": float(render_bounds[0]),
+            "top": float(render_bounds[2]),
+            "right": float(render_bounds[1]),
+            "bottom": float(render_bounds[3]),
+        },
+        "constellation_lines": [],
+        "constellation_labels": [],
+        "deep_sky_markers": [],
+        "deep_sky_labels": [],
+        "star_markers": [],
+        "star_labels": [],
+    }
+
+    if overlay_layer_enabled(overlay_options, "constellation_lines"):
+        for constellation in constellations:
+            line_color = (212, 222, 236, 135 if constellation["show_label"] else 92)
+            for segment in constellation["segments"]:
+                clipped_segment = clip_segment_to_bounds(
+                    segment["start"]["x"],
+                    segment["start"]["y"],
+                    segment["end"]["x"],
+                    segment["end"]["y"],
+                    render_bounds[0],
+                    render_bounds[1],
+                    render_bounds[2],
+                    render_bounds[3],
+                )
+                if clipped_segment is None:
+                    continue
+                if point_distance_squared(*clipped_segment) < 1.0:
+                    continue
+                scene["constellation_lines"].append(
+                    {
+                        "x1": float(clipped_segment[0]),
+                        "y1": float(clipped_segment[1]),
+                        "x2": float(clipped_segment[2]),
+                        "y2": float(clipped_segment[3]),
+                        "line_width": line_width,
+                        "rgba": rgba_to_list(line_color),
+                    }
+                )
+
+    for item in deep_sky_objects:
+        if show_dso_markers:
+            marker, marker_color = dso_style(item)
+            scene["deep_sky_markers"].append(
+                {
+                    "marker": marker,
+                    "x": float(item["x"]),
+                    "y": float(item["y"]),
+                    "radius": dso_radius,
+                    "line_width": line_width,
+                    "rgba": rgba_to_list(marker_color),
+                }
+            )
+        if not show_dso_labels:
+            continue
+        position = place_label(
+            draw,
+            item["display_label"],
+            item["x"],
+            item["y"],
+            image_width,
+            image_height,
+            dso_font,
+            occupied_boxes,
+            offsets=[
+                (10.0, -26.0),
+                (10.0, 10.0),
+                (-112.0, -26.0),
+                (-112.0, 10.0),
+                (14.0, -42.0),
+                (14.0, 24.0),
+                (-128.0, -42.0),
+                (-128.0, 24.0),
+                (8.0, -22.0),
+                (8.0, 8.0),
+                (-86.0, -22.0),
+                (-86.0, 8.0),
+            ],
+            stroke_width=2,
+            bounds=render_bounds,
+        )
+        if not position:
+            continue
+        leader_segment = None
+        if show_label_leaders:
+            leader_segment = compute_label_leader_segment(
+                draw,
+                item["x"],
+                item["y"],
+                position,
+                item["display_label"],
+                dso_font,
+                stroke_width=2,
+            )
+        scene["deep_sky_labels"].append(
+            {
+                "text": item["display_label"],
+                "x": float(position[0]),
+                "y": float(position[1]),
+                "font_size": dso_font_size,
+                "stroke_width": 2,
+                "text_rgba": rgba_to_list((242, 246, 255, 255)),
+                "stroke_rgba": rgba_to_list((0, 0, 0, 220)),
+                "leader": (
+                    {
+                        "x1": leader_segment[0],
+                        "y1": leader_segment[1],
+                        "x2": leader_segment[2],
+                        "y2": leader_segment[3],
+                        "line_width": 1,
+                        "rgba": rgba_to_list((165, 220, 255, 190)),
+                    }
+                    if leader_segment is not None
+                    else None
+                ),
+            }
+        )
+
+    if show_constellation_labels:
+        for constellation in constellations:
+            if not constellation["show_label"]:
+                continue
+            if not constellation["segments"] and not show_contextual_labels:
+                continue
+            position = place_label(
+                draw,
+                constellation["display_name"],
+                constellation["label_x"],
+                constellation["label_y"],
+                image_width,
+                image_height,
+                constellation_font,
+                occupied_boxes,
+                offsets=[
+                    (10.0, 10.0),
+                    (10.0, -34.0),
+                    (-56.0, 10.0),
+                    (-56.0, -34.0),
+                    (12.0, 28.0),
+                    (-74.0, 28.0),
+                ],
+                stroke_width=3,
+                bounds=render_bounds,
+            )
+            if not position:
+                continue
+            scene["constellation_labels"].append(
+                {
+                    "text": constellation["display_name"],
+                    "x": float(position[0]),
+                    "y": float(position[1]),
+                    "font_size": constellation_font_size,
+                    "stroke_width": 3,
+                    "text_rgba": rgba_to_list((225, 232, 245, 255)),
+                    "stroke_rgba": rgba_to_list((0, 0, 0, 230)),
+                }
+            )
+
+    for star in named_stars:
+        if show_star_markers:
+            scene["star_markers"].append(
+                {
+                    "x": float(star["x"]),
+                    "y": float(star["y"]),
+                    "radius": star_radius,
+                    "fill_rgba": rgba_to_list((255, 210, 150, 215)),
+                    "outline_rgba": rgba_to_list((255, 255, 255, 210)),
+                }
+            )
+        if not show_star_labels:
+            continue
+        position = place_label(
+            draw,
+            star["name"],
+            star["x"],
+            star["y"],
+            image_width,
+            image_height,
+            star_font,
+            occupied_boxes,
+            offsets=[
+                (8.0, -20.0),
+                (8.0, 10.0),
+                (-86.0, -20.0),
+                (-86.0, 10.0),
+                (10.0, -34.0),
+                (-96.0, -34.0),
+                (8.0, -18.0),
+                (8.0, 8.0),
+                (-74.0, -18.0),
+                (-74.0, 8.0),
+            ],
+            stroke_width=2,
+            bounds=render_bounds,
+        )
+        if not position:
+            continue
+        leader_segment = None
+        if show_label_leaders:
+            leader_segment = compute_label_leader_segment(
+                draw,
+                star["x"],
+                star["y"],
+                position,
+                star["name"],
+                star_font,
+                stroke_width=2,
+            )
+        scene["star_labels"].append(
+            {
+                "text": star["name"],
+                "x": float(position[0]),
+                "y": float(position[1]),
+                "font_size": star_font_size,
+                "stroke_width": 2,
+                "text_rgba": rgba_to_list((250, 244, 236, 255)),
+                "stroke_rgba": rgba_to_list((0, 0, 0, 220)),
+                "leader": (
+                    {
+                        "x1": leader_segment[0],
+                        "y1": leader_segment[1],
+                        "x2": leader_segment[2],
+                        "y2": leader_segment[3],
+                        "line_width": 1,
+                        "rgba": rgba_to_list((255, 233, 188, 176)),
+                    }
+                    if leader_segment is not None
+                    else None
+                ),
+            }
+        )
+
+    return scene
