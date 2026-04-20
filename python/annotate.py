@@ -39,6 +39,7 @@ from annotate_sky_mask import (
     filter_constellations as filter_constellations_by_sky_mask,
     filter_deep_sky_objects as filter_dsos_by_sky_mask,
     filter_named_stars as filter_named_stars_by_sky_mask,
+    mask_is_trustworthy,
 )
 from annotate_solving import solve_image, summarize_solver_output
 from annotate_types import LocalizationBundle
@@ -128,6 +129,10 @@ def annotate_image(
             sky_mask = None
             if bool(overlay_options.get("mask_foreground", True)):
                 sky_mask = compute_sky_mask(base_image)
+                if sky_mask is not None:
+                    star_positions = [(star["x"], star["y"]) for star in named_stars]
+                    if not mask_is_trustworthy(sky_mask, star_positions):
+                        sky_mask = None
             sky_mask_ms = (time.perf_counter() - sky_mask_start) * 1000.0
             if sky_mask is not None:
                 named_stars = filter_named_stars_by_sky_mask(named_stars, sky_mask)

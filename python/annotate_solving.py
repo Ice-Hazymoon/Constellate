@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,18 @@ import pandas as pd
 from astropy.io import fits
 from astropy.wcs import WCS
 from PIL import Image
+
+# solve-field's --cpulimit is CPU-time only; on a loaded system wall time can
+# run 2-3× longer. Use these as wall-clock hard stops on each subprocess and a
+# total budget for the whole solve loop so an un-solvable image can't lock up
+# the worker indefinitely.
+XYLIST_SUBPROCESS_TIMEOUT_S = 90.0
+IMAGE_SUBPROCESS_TIMEOUT_S = 150.0
+SOLVE_TIME_BUDGET_S = 90.0
+
+
+class SolveTimeoutError(RuntimeError):
+    """Raised when the solve loop exhausts its total time budget."""
 
 from annotate_geometry import (
     compute_field_metrics,
@@ -100,6 +113,7 @@ def run_solve_on_xylist(
     scale_high: float,
     workdir: Path,
     index_dir: Path,
+    max_wall_seconds: float = XYLIST_SUBPROCESS_TIMEOUT_S,
 ) -> SolveResult | None:
     base_name = f"solve-{crop.name}-xyls-s{int(scale_low)}-{int(scale_high)}"
     command = [
@@ -138,7 +152,18 @@ def run_solve_on_xylist(
         str(xylist_path),
     ]
 
-    proc = subprocess.run(command, capture_output=True, text=True, check=False)
+    if max_wall_seconds <= 0:
+        return None
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max_wall_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     wcs_path = workdir / f"{base_name}.wcs"
     solved_flag = workdir / f"{base_name}.solved"
     corr_path = workdir / f"{base_name}.corr"
@@ -167,6 +192,7 @@ def run_solve_on_image(
     scale_high: float,
     workdir: Path,
     index_dir: Path,
+    max_wall_seconds: float = IMAGE_SUBPROCESS_TIMEOUT_S,
 ) -> SolveResult | None:
     base_name = f"solve-{crop.name}-ds{downsample}-s{int(scale_low)}-{int(scale_high)}"
     command = [
@@ -194,7 +220,18 @@ def run_solve_on_image(
         str(image_path),
     ]
 
-    proc = subprocess.run(command, capture_output=True, text=True, check=False)
+    if max_wall_seconds <= 0:
+        return None
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max_wall_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     wcs_path = workdir / f"{base_name}.wcs"
     solved_flag = workdir / f"{base_name}.solved"
 
@@ -470,8 +507,18 @@ def solve_image(
         crop for crop in candidate_crops if crop.name != "full"
     ]
 
+    solve_start = time.perf_counter()
+
+    def remaining_budget() -> float:
+        return SOLVE_TIME_BUDGET_S - (time.perf_counter() - solve_start)
+
+    def budget_exhausted() -> bool:
+        return remaining_budget() <= 0.0
+
     if source_analysis.mode == "sep" and source_analysis.detections:
         for crop in candidate_crops:
+            if budget_exhausted():
+                break
             xylist_path, source_count = write_xylist(source_analysis, crop, workdir)
             if xylist_path is None:
                 attempts.append(
@@ -489,7 +536,17 @@ def solve_image(
                 continue
 
             for scale_low, scale_high in scale_windows:
-                result = run_solve_on_xylist(xylist_path, crop, scale_low, scale_high, workdir, index_dir)
+                if budget_exhausted():
+                    break
+                result = run_solve_on_xylist(
+                    xylist_path,
+                    crop,
+                    scale_low,
+                    scale_high,
+                    workdir,
+                    index_dir,
+                    max_wall_seconds=min(XYLIST_SUBPROCESS_TIMEOUT_S, remaining_budget()),
+                )
                 verification = verify_solution(result) if result else None
                 if result and verification and verification["accepted"]:
                     verification = enrich_solution_verification(
@@ -555,6 +612,8 @@ def solve_image(
         fallback_scale_windows = [estimate_scale_window(best_xyls, crop) for crop in fallback_crops]
 
     for crop_index, crop in enumerate(fallback_crops):
+        if budget_exhausted():
+            break
         crop_path = save_crop(image, crop, workdir)
         crop_accepted = False
         crop_scale_windows = (
@@ -563,8 +622,21 @@ def solve_image(
             else scale_windows
         )
         for scale_low, scale_high in crop_scale_windows:
+            if budget_exhausted():
+                break
             for downsample in (2, 4, 1):
-                result = run_solve_on_image(crop_path, crop, downsample, scale_low, scale_high, workdir, index_dir)
+                if budget_exhausted():
+                    break
+                result = run_solve_on_image(
+                    crop_path,
+                    crop,
+                    downsample,
+                    scale_low,
+                    scale_high,
+                    workdir,
+                    index_dir,
+                    max_wall_seconds=min(IMAGE_SUBPROCESS_TIMEOUT_S, remaining_budget()),
+                )
                 verification = verify_solution(result) if result else None
                 if result and verification and verification["accepted"]:
                     verification = enrich_solution_verification(
@@ -611,6 +683,12 @@ def solve_image(
             )
         return best_result, attempts, source_analysis.diagnostics
 
+    elapsed = time.perf_counter() - solve_start
+    if budget_exhausted():
+        raise SolveTimeoutError(
+            f"plate solving aborted after {elapsed:.1f}s (budget {SOLVE_TIME_BUDGET_S:.0f}s); "
+            f"image may be too wide-field, too distorted, or contain too few matchable stars"
+        )
     raise RuntimeError("plate solving failed for all full-image and scored-crop attempts")
 
 

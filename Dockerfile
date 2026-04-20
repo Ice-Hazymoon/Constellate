@@ -8,6 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    HF_HOME=/app/hf_cache \
     HTTP_PROXY= \
     HTTPS_PROXY= \
     ALL_PROXY= \
@@ -29,11 +30,29 @@ RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_prox
 RUN python3 -m venv /app/.venv
 ENV PATH="/app/.venv/bin:${PATH}"
 
+# Install CPU-only torch first. Upstream pulls the CUDA build by default on
+# linux, which would add ~1.5GB of GPU libraries we don't use. Install
+# torch/torchvision from the official CPU wheel index before the rest of the
+# requirements so transformers picks it up as already-satisfied.
+RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+    && pip install --proxy "" --no-cache-dir \
+       --index-url https://download.pytorch.org/whl/cpu \
+       torch torchvision
+
 COPY requirements.txt ./
 RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
     && pip install --proxy "" --no-cache-dir -r requirements.txt \
     && find /app/.venv -name '*.pyc' -delete \
     && find /app/.venv -name '__pycache__' -type d -prune -exec rm -rf '{}' +
+
+# Bake the sky-mask model into the image so the container doesn't pull ~490MB
+# from HuggingFace on first request. Fails the build if the model can't be
+# fetched, which is better than silently degrading at runtime.
+COPY python/annotate_sky_mask.py /tmp/annotate_sky_mask.py
+RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+    && python3 -c "import sys; sys.path.insert(0, '/tmp'); import annotate_sky_mask as m; assert m.preload(), 'sky-mask model failed to load during build'" \
+    && rm /tmp/annotate_sky_mask.py \
+    && find /app/hf_cache -name '*.pyc' -delete 2>/dev/null || true
 
 FROM oven/bun:debian AS data-bootstrap
 
@@ -79,6 +98,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NODE_ENV=production \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    HF_HOME=/app/hf_cache \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
     HTTP_PROXY= \
     HTTPS_PROXY= \
     ALL_PROXY= \
@@ -98,6 +120,7 @@ RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_prox
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=python-deps /app/.venv /app/.venv
+COPY --from=python-deps --chown=bun:bun /app/hf_cache /app/hf_cache
 ENV PATH="/app/.venv/bin:${PATH}"
 
 COPY --from=data-bootstrap --chown=bun:bun /app/data /app/data

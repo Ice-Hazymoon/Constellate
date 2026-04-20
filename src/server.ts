@@ -288,9 +288,28 @@ function finalizeResponse(request: Request | undefined, response: Response, requ
   });
 }
 
+const PLATE_SOLVE_FAILURE_MARKERS = [
+  "plate solving aborted",
+  "plate solving failed",
+];
+
+function isPlateSolveFailure(message: string): boolean {
+  const lower = message.toLowerCase();
+  return PLATE_SOLVE_FAILURE_MARKERS.some((marker) => lower.includes(marker));
+}
+
 function errorResponse(error: unknown, requestId?: string, request?: Request) {
   if (error instanceof HttpError) {
     return finalizeResponse(request, jsonResponse({ error: error.message }, { status: error.status }), requestId);
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (isPlateSolveFailure(message)) {
+    logInfo("plate-solve failed for request", requestId ? { requestId, message } : { message });
+    return finalizeResponse(
+      request,
+      jsonResponse({ error: message, code: "plate_solve_failed" }, { status: 422 }),
+      requestId,
+    );
   }
   logError("request failed", error, requestId ? { requestId } : undefined);
   return finalizeResponse(request, jsonResponse({ error: "internal server error" }, { status: 500 }), requestId);

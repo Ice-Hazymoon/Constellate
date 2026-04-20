@@ -189,6 +189,24 @@ def _in_sky(mask: np.ndarray, x: float, y: float) -> bool:
     return bool(mask[yi, xi])
 
 
+def mask_is_trustworthy(
+    mask: np.ndarray,
+    star_positions: list[tuple[float, float]],
+    min_sky_ratio: float = 0.25,
+) -> bool:
+    """Sanity-check a mask against plate-solved star positions. Stars can only
+    appear in the sky, so if almost none of them land in the mask's sky
+    region, the segmentation model hallucinated a horizon (common on pure
+    night-sky images with a brightness vignette) and the mask should be
+    discarded. The threshold is intentionally low: in a real horizon shot
+    (e.g. Orion rising behind trees) many named stars legitimately sit at or
+    below the treeline, so a 50% rejection rule would nuke correct masks."""
+    if not star_positions:
+        return True
+    in_sky = sum(1 for x, y in star_positions if _in_sky(mask, x, y))
+    return (in_sky / len(star_positions)) >= min_sky_ratio
+
+
 def filter_named_stars(
     named_stars: list[dict[str, Any]], mask: np.ndarray | None
 ) -> list[dict[str, Any]]:
