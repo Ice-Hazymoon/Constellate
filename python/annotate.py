@@ -144,13 +144,13 @@ def annotate_image(
             scene_ms = (time.perf_counter() - scene_start) * 1000.0
 
             # Validate the mask against plate-solved star positions before
-            # applying it to the scene. If the model hallucinated a horizon
-            # (common on pure night-sky images with vignetting), too many
-            # real stars land on "ground" pixels and we drop the mask.
+            # applying it to the scene. If the model/fallback guessed a bad
+            # boundary, too many real stars land on "ground" pixels and we
+            # drop the mask.
             mask_requested = bool(overlay_options.get("mask_foreground", True))
             mask_reason: str
             if sky_mask is None:
-                mask_reason = "not_requested" if not mask_requested else "model_unavailable"
+                mask_reason = "not_requested" if not mask_requested else "mask_failed"
             else:
                 star_positions = [(star["x"], star["y"]) for star in named_stars]
                 if not mask_is_trustworthy(sky_mask, star_positions):

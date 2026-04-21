@@ -1,14 +1,10 @@
 astroquery
 astropy
-onnx
 onnxruntime
-onnxscript
+huggingface_hub
 pandas
 pillow
 requests
 scipy
 skyfield
 sep
-torch
-torchvision
-transformers

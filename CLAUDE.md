@@ -37,8 +37,8 @@ bun run sample:apod4       # or sample:apod5, sample:orion
   --dso-catalog data/reference/NGC.csv \
   --dso-catalog data/reference/stardroid-deep_sky_objects.csv
 
-# Re-export the quantized ONNX sky-mask model (after changing MODEL_ID or INFERENCE_SIZE)
-.venv/bin/python3 python/export_sky_mask_onnx.py hf_cache
+# Preload the ONNX sky-mask model into the local HF cache
+.venv/bin/python3 -c "import sys; sys.path.insert(0, 'python'); import annotate_sky_mask as m; print(m.preload())"
 ```
 
 `solve-field` (Astrometry.net) must be installed on the host; the Dockerfile installs it via `apt`.
@@ -71,31 +71,31 @@ Sequential stages — each contributes to `timings_ms` in the response:
 1. **normalize** (`annotate_image_ops.py`) — decode image, set PIL `MAX_IMAGE_PIXELS`, filter FITS warnings.
 2. **solve** (`annotate_solving.py`) — plate solve via `solve-field`. Tries a ladder of (crop candidate × scale window) attempts under a total `SOLVE_TIME_BUDGET_S` wall budget; cpulimits and wall timeouts sized empirically from sample profiling (see comment at top of the file). Each attempt's wall time is recorded in `attempts[].wall_ms` for diagnostics. **Astrometry.net is non-deterministic across runs** — two consecutive solves on the same image can produce slightly different WCS and thus different downstream visible-object lists.
 3. **scene** (`annotate_scene.py`) — project catalog stars, constellation segments, and DSOs through the WCS. All three collectors use a single batched `project_points` + `skycoord_separation_degrees` call per catalog; per-object astropy calls in inner loops are a known perf trap (the DSO catalog alone is ~14k entries).
-4. **sky_mask** (`annotate_sky_mask.py`) — SegFormer-b4 on ADE20K, `sky` class index 2. See "Sky mask" below.
+4. **sky_mask** (`annotate_sky_mask.py`) — `JianyuanWang/skyseg` ONNX model with heuristic fallback. See "Sky mask" below.
 5. **overlay_scene** (`annotate_scene.py:build_overlay_scene`) — assemble render-ready JSON (dedup, label placement, leader lines).
 6. **render** — optional; only runs when `output_image_path` is provided (render_mode=`server`).
 
 ### Sky mask (`python/annotate_sky_mask.py`)
 
-Runtime: loads an **int8-quantized ONNX graph** via `onnxruntime` from `$HF_HOME/sky_mask_int8.onnx` (Docker bakes this during build); falls back to PyTorch `SegformerForSemanticSegmentation` if the ONNX file is missing (local dev without `export_sky_mask_onnx.py`).
+Runtime: loads `skyseg.onnx` via `onnxruntime` from `$HF_HOME/skyseg.onnx` (Docker bakes this during build; local dev downloads on first preload if missing). The model input is fixed at `320×320`, uses ImageNet mean/std normalization, and averages all seven U-2-Net outputs before thresholding.
 
-Preprocessing decision is made up front from the downsampled image's **median brightness**: below `PURE_SKY_MEDIAN_THRESHOLD` (25) → raw inference with tonemap fallback if the model disagrees; above → tonemap directly. This avoids the expensive double-inference the old code did.
+Night-sky images can still confuse the model. When the model mask is obviously bad (e.g. tiny sky area or weak top-edge coverage), the code falls back to the skyline heuristic in the same module. That fallback can also decide the whole frame is sky and return a full-frame mask, which avoids the "Milky Way cut out of a pure-sky shot" failure mode.
 
-**Three load-bearing constants that were tested and reverted from "obvious" optimizations — don't change them without re-measuring on `samples/orion-over-pines.jpg`:**
+Load-bearing pieces here:
 
-- `INFERENCE_SIZE = 512` — b4 was finetuned on 512×512; dropping to 384 collapses tonemap sky ratio from 44% → 0% on orion. If you ever change it, re-export the ONNX with `export_sky_mask_onnx.py` (the graph's input shape is fixed at export time).
-- `MODEL_ID = "nvidia/segformer-b4-finetuned-ade-512-512"` — b0 appears tempting (17× fewer params) but goes OOD on star fields, classifying sky as `tree` (class 4) or `water` (class 21).
-- `_downsample` uses `Image.LANCZOS` — BILINEAR blurs fine foreground detail (tree silhouettes etc.) enough to drop orion sky ratio from 33% to 4%.
+- `MODEL_INPUT_SIZE = 320` — matches the hosted ONNX graph.
+- `_model_mask_is_reasonable(...)` — rejects tiny or inverted model masks before they affect solving/rendering.
+- The heuristic fallback constants (`ANALYSIS_SIZE`, `BACKGROUND_SIGMA`, `BOUNDARY_STEP_*`, `PURE_SKY_*`) — these are what preserve the Orion treeline / all-sky behavior when the model is out of domain.
 
-After the model: scipy.ndimage for morphological closing, flood-from-border ground-blob removal, and safety-margin erosion (`SKY_SAFETY_MARGIN_PX = 12` at 512 scale). `mask_is_trustworthy` rejects masks where <25% of plate-solved stars fall in sky.
+After the model/fallback: `mask_is_trustworthy` rejects masks that are geometrically implausible or place <25% of plate-solved stars in sky.
 
 ### Data layout
 
 - `data/astrometry/` — large index files, not in Git. Populated by `bun run bootstrap` or the Docker data-bootstrap stage.
 - `data/catalog/minimal_hipparcos.csv` — HIP star catalog, pre-filtered to stars referenced by constellations + named-star tables.
 - `data/reference/` — Stellarium + Stardroid constellation lines, DSO catalogs, localization XMLs. Provenance in `docs/data-sources.md`.
-- `hf_cache/` — HuggingFace model cache + the exported `sky_mask_int8.onnx`. Not in Git; Docker bakes into the image.
+- `hf_cache/` — HuggingFace cache for the baked `skyseg.onnx` model. Not in Git; Docker populates it during build.
 
 ### Docker build
 
-Three stages: `python-deps` (installs CPU-only torch + requirements, downloads the sky-mask model, exports the quantized ONNX), `data-bootstrap` (downloads astrometry indexes and reference data), final runtime (copies `/app/.venv` and `/app/hf_cache` from the first stage, `/app/data` from the second). Environment in the final stage sets `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` — the HF cache must be populated by the build or the worker will fail to preload.
+Three stages: `python-deps` (installs Python requirements and preloads the ONNX sky-mask model), `data-bootstrap` (downloads astrometry indexes and reference data), and final runtime (copies `/app/.venv`, `/app/hf_cache`, and `/app/data`). The final image sets `HF_HUB_OFFLINE=1`, so the model cache must be populated during build.

@@ -30,32 +30,19 @@ RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_prox
 RUN python3 -m venv /app/.venv
 ENV PATH="/app/.venv/bin:${PATH}"
 
-# Install CPU-only torch first. Upstream pulls the CUDA build by default on
-# linux, which would add ~1.5GB of GPU libraries we don't use. Install
-# torch/torchvision from the official CPU wheel index before the rest of the
-# requirements so transformers picks it up as already-satisfied.
-RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
-    && pip install --proxy "" --no-cache-dir \
-       --index-url https://download.pytorch.org/whl/cpu \
-       torch torchvision
-
 COPY requirements.txt ./
 RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
     && pip install --proxy "" --no-cache-dir -r requirements.txt \
     && find /app/.venv -name '*.pyc' -delete \
     && find /app/.venv -name '__pycache__' -type d -prune -exec rm -rf '{}' +
 
-# Bake the sky-mask model into the image so the container doesn't pull it
-# from HuggingFace on first request, and export it to int8-quantized ONNX
-# (annotate_sky_mask.py loads this via onnxruntime at runtime, which is 2-3×
-# faster than the PyTorch path). Fails the build if either step breaks —
-# better than silently degrading at runtime.
+# Bake the ONNX sky-mask model into the image so the container does not pull
+# it from Hugging Face on first request. Fails the build if the download or
+# model preload breaks rather than silently degrading at runtime.
 COPY python/annotate_sky_mask.py /tmp/annotate_sky_mask.py
-COPY python/export_sky_mask_onnx.py /tmp/export_sky_mask_onnx.py
 RUN export http_proxy= HTTPS_PROXY= HTTP_PROXY= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
-    && python3 /tmp/export_sky_mask_onnx.py /app/hf_cache \
     && python3 -c "import sys; sys.path.insert(0, '/tmp'); import annotate_sky_mask as m; assert m.preload(), 'sky-mask model failed to load during build'" \
-    && rm /tmp/annotate_sky_mask.py /tmp/export_sky_mask_onnx.py \
+    && rm /tmp/annotate_sky_mask.py \
     && find /app/hf_cache -name '*.pyc' -delete 2>/dev/null || true
 
 FROM oven/bun:debian AS data-bootstrap
@@ -104,7 +91,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/app/hf_cache \
     HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
     HTTP_PROXY= \
     HTTPS_PROXY= \
     ALL_PROXY= \
