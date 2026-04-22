@@ -64,11 +64,22 @@ Sequential stages, each contributing to `timings_ms`:
 5. `overlay_scene` (`annotate_scene.py:build_overlay_scene`) - assemble render-ready JSON.
 6. `render` - optional, only when `render_mode=server`.
 
+### Response headers
+
+Every response from `star_server.app` carries:
+
+- `X-Request-Id`, `Cache-Control: no-store` (overridden to `public, max-age=86400` for `/samples/*`).
+- Security headers: `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, and a strict CSP (`default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`).
+- CORS headers when the request `Origin` is allowed by `CORS_ALLOWED_ORIGINS`.
+
+The CSP forbids inline scripts. `public/index.html` only loads `/app.js` from the same origin; any future inline `<script>` or `on*=` attribute will be blocked by the browser.
+
 ### Invariants
 
 - **Astrometry.net is non-deterministic across runs.** Two solves on the same image can produce slightly different WCS and downstream visible-object lists.
 - **Sky mask behavior is load-bearing.** The fallback heuristics and trust checks preserve the Orion treeline / all-sky behavior when the model is out of domain.
 - **Business logic files are intentionally stable.** Avoid changing `python/annotate.py`, `annotate_solving.py`, `annotate_scene.py`, `annotate_sky_mask.py`, `annotate_image_ops.py`, `annotate_types.py`, and `annotate_geometry.py` unless the task explicitly requires it.
+- **`AnnotationRunner` patches `subprocess.Popen` globally.** This is required so outer-timeout cancellation can reach `solve-field`'s grandchildren via `killpg`. See the module docstring in `star_server/annotation_runner.py`.
 
 ## Data layout
 

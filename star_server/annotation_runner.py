@@ -1,3 +1,26 @@
+"""
+In-process annotation runner.
+
+`AnnotationRunner.__init__` installs `_TrackingPopen` as the global
+`subprocess.Popen`. This is intentional and load-bearing for outer-timeout
+cancellation: when the FastAPI request times out we need to kill the entire
+`solve-field` process group (it spawns `cpulimit`, `augustin`, etc.), and the
+only way to reach those grandchildren is `os.killpg`, which in turn requires
+the leader to have been started with `start_new_session=True`. The patched
+`Popen` sets that flag for any subprocess launched inside an annotation job
+(detected via thread-local `job_control`); calls outside a job context — the
+startup `python --version` / `solve-field --help` checks, anything in a third
+party library — fall through unmodified.
+
+Side effects to be aware of when touching this file:
+- Subprocesses inside annotation jobs run in a new process group, so they
+  no longer receive terminal SIGINT from the parent's controlling terminal.
+- `subprocess.run(..., timeout=...)` inside the pipeline kills only the leader
+  on per-attempt timeout; grandchildren are reparented to init and exit shortly
+  after. Outer wall-clock cancellation goes through `kill_active_processes` →
+  `killpg(SIGKILL)`, which is the clean path.
+"""
+
 from __future__ import annotations
 
 import asyncio

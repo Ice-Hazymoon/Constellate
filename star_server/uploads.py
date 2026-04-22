@@ -66,11 +66,12 @@ async def save_upload_file(
 ) -> UploadValidation:
     filename = upload.filename or ""
     normalized_mime_type = (upload.content_type or "").lower()
-    extension = extract_allowed_image_extension(filename)
-    if not extension and normalized_mime_type not in ALLOWED_IMAGE_TYPES:
+    # Reject non-image content before streaming any bytes to disk.
+    if not extract_allowed_image_extension(filename) and normalized_mime_type not in ALLOWED_IMAGE_TYPES:
         raise HttpError(415, "only JPG, PNG, and WebP images are supported")
 
     size = 0
+    limit_mb = round(max_upload_bytes / (1024 * 1024))
     with destination.open("wb") as handle:
         while True:
             chunk = await upload.read(chunk_size)
@@ -78,8 +79,13 @@ async def save_upload_file(
                 break
             size += len(chunk)
             if size > max_upload_bytes:
-                limit_mb = round(max_upload_bytes / (1024 * 1024))
                 raise HttpError(413, f"image exceeds upload limit of {limit_mb} MB")
             handle.write(chunk)
 
-    return validate_image_upload(filename, normalized_mime_type, size, max_upload_bytes)
+    if size <= 0:
+        raise HttpError(400, "uploaded file is empty")
+
+    return UploadValidation(
+        extension=guess_extension(filename, normalized_mime_type),
+        mime_type=normalized_mime_type,
+    )
