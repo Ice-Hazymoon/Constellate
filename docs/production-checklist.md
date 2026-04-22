@@ -14,14 +14,13 @@
 - [ ] Upload size capped
 - [ ] Unsupported file types rejected
 - [ ] Busy server returns `429` instead of queueing unbounded work
-- [ ] Worker jobs have a hard timeout
+- [ ] Annotation jobs have a hard timeout
 
 ## Process management
 
-- [ ] Worker preloaded at startup
-- [ ] Worker crash triggers clean rejection of in-flight jobs
-- [ ] Graceful shutdown stops HTTP server and worker process
-- [ ] Old generated files are cleaned up on an interval
+- [ ] Reference data and sky-mask model preload at startup
+- [ ] Graceful shutdown stops HTTP server and in-process executor cleanly
+- [ ] Request-scoped temp files are removed after each run
 
 ## Security and privacy
 
@@ -34,12 +33,12 @@
 
 - [ ] Request IDs added to API responses
 - [ ] Startup failures are explicit and fail fast
-- [ ] Health response includes worker/job state
+- [ ] Health response includes preload/job state
 - [ ] Error paths are logged without leaking stack traces to clients
 
 ## Verification
 
-- [ ] `bun run typecheck`
-- [ ] `bun run test`
-- [ ] `bun run sample:orion`
+- [ ] `pytest -q`
+- [ ] `python -m star_server`
+- [ ] `curl -s -F image=@samples/orion-over-pines.jpg http://127.0.0.1:3000/api/analyze`
 - [ ] Manual smoke check of `/healthz`, `/readyz`, `/api/analyze`

@@ -116,16 +116,12 @@ def overlay_detail_value(overlay_options: dict[str, Any], key: str) -> Any:
     return overlay_options.get("detail", {}).get(key)
 
 
-def parse_overlay_options(raw_options: str) -> dict[str, Any]:
+def clone_overlay_options() -> dict[str, Any]:
+    return deepcopy(DEFAULT_OVERLAY_OPTIONS)
+
+
+def _normalize_overlay_options_payload(payload: dict[str, Any]) -> dict[str, Any]:
     options = deepcopy(DEFAULT_OVERLAY_OPTIONS)
-    payload: dict[str, Any] = {}
-    if raw_options:
-        try:
-            parsed = json.loads(raw_options)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"invalid overlay options JSON: {exc}") from exc
-        if isinstance(parsed, dict):
-            payload = parsed
 
     preset_name = str(payload.get("preset") or options["preset"]).strip().lower()
     preset = OVERLAY_PRESETS.get(preset_name, OVERLAY_PRESETS[options["preset"]])
@@ -145,5 +141,31 @@ def parse_overlay_options(raw_options: str) -> dict[str, Any]:
     detail["show_all_constellation_labels"] = bool(detail.get("show_all_constellation_labels"))
     detail["detailed_dso_labels"] = bool(detail.get("detailed_dso_labels"))
     detail["include_catalog_dsos"] = bool(detail.get("include_catalog_dsos"))
-    options["mask_foreground"] = bool(options.get("mask_foreground", True))
+
+    for key in list(options.get("layers", {})):
+        options["layers"][key] = bool(options["layers"][key])
+
+    options["mask_foreground"] = options.get("mask_foreground") is not False
     return options
+
+
+def normalize_overlay_options(value: Any) -> dict[str, Any]:
+    if value is None or value == "":
+        return clone_overlay_options()
+    if isinstance(value, dict):
+        payload = value
+    else:
+        payload = {}
+    return _normalize_overlay_options_payload(payload)
+
+
+def parse_overlay_options(raw_options: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if raw_options:
+        try:
+            parsed = json.loads(raw_options)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid overlay options JSON: {exc}") from exc
+        if isinstance(parsed, dict):
+            payload = parsed
+    return _normalize_overlay_options_payload(payload)

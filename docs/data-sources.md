@@ -36,9 +36,9 @@ These sources define object identity, coordinates, or accepted naming:
   - used for curated Messier and notable DSO aliases
 - `data/reference/stardroid-locales/*/celestial_objects.xml`
   - copied from Stardroid Android resources
-  - currently bundles 30 locale variants including `en`, `en-GB`, `ja`, `fr`, `de`, `zh-Hans`, `zh-Hant`, `ru`, and others
+  - currently ships 30 locale variants including `en`, `en-GB`, `ja`, `fr`, `de`, `zh-Hans`, `zh-Hant`, `ru`, and others
   - used as the primary maintained localization source for constellation names and part of the DSO label set
-  - request-time locale selection always falls back to the bundled English source table instead of hand-written translations
+  - request-time locale selection always falls back to the included English source table instead of hand-written translations
 - `data/reference/supplemental-deep-sky-objects.json`
   - project-owned supplement for objects not covered cleanly by the main catalogs
   - currently limited to the Hyades cluster so the runtime stays small and traceable

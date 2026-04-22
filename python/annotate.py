@@ -246,14 +246,14 @@ def main() -> None:
         output_image_path.parent.mkdir(parents=True, exist_ok=True)
     output_json_path.parent.mkdir(parents=True, exist_ok=True)
 
-    localization_bundle = load_localized_names(localization_paths, locale)
-    star_names = load_star_names(star_names_path, localization_bundle.strings)
-    constellations = load_constellations(constellation_paths, localization_bundle.strings)
+    localization_data = load_localized_names(localization_paths, locale)
+    star_names = load_star_names(star_names_path, localization_data.strings)
+    constellations = load_constellations(constellation_paths, localization_data.strings)
     constellation_name_map = build_constellation_name_map(constellations)
     deep_sky_objects = load_deep_sky_objects(
         dso_paths,
         constellation_name_map,
-        localization_bundle.strings,
+        localization_data.strings,
         supplemental_dso_path,
     )
     required_hips = collect_required_hips(constellations, star_names)
@@ -266,7 +266,7 @@ def main() -> None:
         deep_sky_objects=deep_sky_objects,
         star_names=star_names,
         overlay_options=overlay_options,
-        localization=localization_bundle,
+        localization=localization_data,
         output_image_path=output_image_path,
     )
     output_json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
