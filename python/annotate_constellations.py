@@ -8,7 +8,9 @@ from typing import Any
 from skyfield.data import stellarium
 
 from annotate_localization import (
+    CONSTELLATION_RESOURCE_OVERRIDES,
     SUPPLEMENTAL_CONSTELLATION_ABBR_OVERRIDES,
+    find_resource_key,
     normalize_constellation_key,
     normalize_human_alias,
     resolve_constellation_display_name,
@@ -22,11 +24,22 @@ def load_star_names(star_names_path: Path, localized_names: dict[str, str]) -> d
     return {entry.hip: entry.name for entry in entries}
 
 
+def resolve_constellation_resource_key(
+    abbr: str,
+    english_name: str,
+    native_name: str | None,
+    localized_names: dict[str, str],
+) -> str | None:
+    overrides = CONSTELLATION_RESOURCE_OVERRIDES.get(abbr, ())
+    return find_resource_key(localized_names, native_name, english_name, *overrides)
+
+
 def build_constellation_entry(
     abbr: str,
     english_name: str,
     native_name: str | None = None,
     display_name: str | None = None,
+    resource_key: str | None = None,
 ) -> dict[str, Any]:
     resolved_native_name = native_name or english_name or abbr
     return {
@@ -34,6 +47,7 @@ def build_constellation_entry(
         "english_name": english_name or abbr,
         "native_name": resolved_native_name,
         "display_name": display_name or resolved_native_name,
+        "resource_key": resource_key,
         "lines": [],
         "label_ra_degrees": None,
         "label_dec_degrees": None,
@@ -47,6 +61,8 @@ def merge_constellation_entries(target: dict[str, Any], incoming: dict[str, Any]
         target["native_name"] = incoming["native_name"]
     if not target["display_name"] and incoming["display_name"]:
         target["display_name"] = incoming["display_name"]
+    if not target.get("resource_key") and incoming.get("resource_key"):
+        target["resource_key"] = incoming["resource_key"]
 
     for polyline in incoming.get("lines", []):
         if len(polyline) >= 2:
@@ -183,16 +199,24 @@ def load_constellations(constellation_paths: list[Path], localized_names: dict[s
             common_name = item.get("common_name", {})
             constellation_id = item["id"].split()[-1]
             fallback_name = common_name.get("native", common_name.get("english", constellation_id))
+            english_name = common_name.get("english", constellation_id)
+            resource_key = resolve_constellation_resource_key(
+                constellation_id,
+                english_name,
+                fallback_name,
+                localized_names,
+            )
             incoming = build_constellation_entry(
                 constellation_id,
-                common_name.get("english", constellation_id),
+                english_name,
                 fallback_name,
                 resolve_constellation_display_name(
                     constellation_id,
-                    common_name.get("english", constellation_id),
+                    english_name,
                     fallback_name,
                     localized_names,
                 ),
+                resource_key=resource_key,
             )
             incoming["lines"] = [[int(hip) for hip in polyline] for polyline in item["lines"] if len(polyline) >= 2]
             target = merged.setdefault(
@@ -202,6 +226,7 @@ def load_constellations(constellation_paths: list[Path], localized_names: dict[s
                     incoming["english_name"],
                     incoming["native_name"],
                     incoming["display_name"],
+                    resource_key=incoming.get("resource_key"),
                 ),
             )
             merge_constellation_entries(target, incoming)
@@ -221,13 +246,24 @@ def load_constellations(constellation_paths: list[Path], localized_names: dict[s
             resolved_abbr = abbr
 
             existing = merged.get(resolved_abbr)
+            incoming_english_name = existing["english_name"] if existing else english_name
+            incoming_native_name = existing["native_name"] if existing else english_name
+            resource_key = existing.get("resource_key") if existing else None
+            if not resource_key:
+                resource_key = resolve_constellation_resource_key(
+                    resolved_abbr,
+                    incoming_english_name,
+                    incoming_native_name,
+                    localized_names,
+                )
             incoming = build_constellation_entry(
                 resolved_abbr,
-                existing["english_name"] if existing else english_name,
-                existing["native_name"] if existing else english_name,
+                incoming_english_name,
+                incoming_native_name,
                 existing["display_name"]
                 if existing
                 else resolve_constellation_display_name(resolved_abbr, english_name, english_name, localized_names),
+                resource_key=resource_key,
             )
             incoming["label_ra_degrees"] = item["label_ra_degrees"]
             incoming["label_dec_degrees"] = item["label_dec_degrees"]
@@ -239,6 +275,7 @@ def load_constellations(constellation_paths: list[Path], localized_names: dict[s
                     incoming["english_name"],
                     incoming["native_name"],
                     incoming["display_name"],
+                    resource_key=incoming.get("resource_key"),
                 ),
             )
             merge_constellation_entries(target, incoming)

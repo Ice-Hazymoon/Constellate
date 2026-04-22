@@ -188,6 +188,13 @@ def resolve_localized_name(localized_names: dict[str, str], *values: str | None)
     return None
 
 
+def find_resource_key(localized_names: dict[str, str], *values: str | None) -> str | None:
+    for key in resource_key_candidates(*values):
+        if key in localized_names:
+            return key
+    return None
+
+
 def resolve_constellation_display_name(
     abbr: str,
     english_name: str,

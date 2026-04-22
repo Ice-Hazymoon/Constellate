@@ -11,6 +11,7 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord
 
 from annotate_localization import (
+    find_resource_key,
     normalize_constellation_key,
     normalize_human_alias,
     normalize_lookup_key,
@@ -103,6 +104,16 @@ def resolve_dso_label(
     return name
 
 
+def resolve_dso_resource_key(
+    name: str,
+    messier: str | None,
+    common_names: list[str],
+    localized_names: dict[str, str],
+    catalog_id: str | None = None,
+) -> str | None:
+    return find_resource_key(localized_names, messier, *common_names, name, catalog_id)
+
+
 def normalize_constellation_abbr(value: str | None, constellation_name_map: dict[str, str]) -> str:
     text = (value or "").strip()
     if not text:
@@ -151,6 +162,10 @@ def merge_dso_entry(target: dict[str, Any], incoming: dict[str, Any]) -> None:
     incoming_label = incoming.get("label")
     if incoming_label and (not current_label or current_label == target.get("name") or incoming.get("curated")):
         target["label"] = incoming_label
+        if incoming.get("label_key"):
+            target["label_key"] = incoming["label_key"]
+    elif not target.get("label_key") and incoming.get("label_key"):
+        target["label_key"] = incoming["label_key"]
 
 
 def load_openngc_objects(
@@ -189,6 +204,7 @@ def load_openngc_objects(
                     "common_name": choose_common_name(common_names),
                     "common_names": common_names,
                     "label": resolve_dso_label(name, messier, common_names, localized_names, catalog_id),
+                    "label_key": resolve_dso_resource_key(name, messier, common_names, localized_names, catalog_id),
                     "curated": False,
                 }
             )
@@ -248,6 +264,7 @@ def load_stardroid_dso_objects(
                     "common_name": choose_common_name(common_names),
                     "common_names": common_names,
                     "label": resolve_dso_label(primary_name, messier, common_names, localized_names, catalog_id),
+                    "label_key": resolve_dso_resource_key(primary_name, messier, common_names, localized_names, catalog_id),
                     "curated": True,
                 }
             )
@@ -276,9 +293,18 @@ def load_supplemental_deep_sky_objects(
         common_name = choose_common_name(common_names)
         messier = format_messier_label(item.get("messier"))
         catalog_id = str(item.get("catalog_id") or name).strip() or name
+        explicit_label_key = str(item.get("label_key") or "").strip() or None
         label = resolve_localized_name(
             localized_names,
-            str(item.get("label_key") or ""),
+            explicit_label_key,
+            messier,
+            *common_names,
+            name,
+            catalog_id,
+        )
+        label_key = find_resource_key(
+            localized_names,
+            explicit_label_key,
             messier,
             *common_names,
             name,
@@ -298,6 +324,7 @@ def load_supplemental_deep_sky_objects(
                 "common_name": common_name,
                 "common_names": common_names,
                 "label": strip_catalog_prefix(label, messier, catalog_id) if label else (common_name or name),
+                "label_key": label_key,
                 "curated": True,
             }
         )

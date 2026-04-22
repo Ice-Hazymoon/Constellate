@@ -26,7 +26,7 @@ from annotate_geometry import (
     segment_intersects_crop,
     skycoord_separation_degrees,
 )
-from annotate_localization import normalize_lookup_key
+from annotate_localization import normalize_constellation_key, normalize_lookup_key
 from annotate_options import overlay_detail_value, overlay_layer_enabled
 from annotate_types import CropCandidate
 
@@ -305,10 +305,12 @@ def collect_named_stars(
             continue
         if not is_point_visible(float(x_value), float(y_value), image_width, image_height, margin=12.0):
             continue
+        star_name = star_names[int(hip)]
         visible.append(
             {
                 "hip": int(hip),
-                "name": star_names[int(hip)],
+                "name": star_name,
+                "name_key": normalize_constellation_key(star_name) or None,
                 "magnitude": float(row["magnitude"]),
                 "x": float(x_value),
                 "y": float(y_value),
@@ -538,6 +540,7 @@ def collect_constellations(
                 "english_name": constellation["english_name"],
                 "native_name": constellation["native_name"],
                 "display_name": constellation["display_name"],
+                "resource_key": constellation.get("resource_key"),
                 "label_x": float(label_x),
                 "label_y": float(label_y),
                 "segments": visible_segments,
@@ -731,6 +734,7 @@ def add_contextual_constellation_labels(
                 "english_name": reference["english_name"],
                 "native_name": reference["native_name"],
                 "display_name": reference["display_name"],
+                "resource_key": reference.get("resource_key"),
                 "label_x": float(label_x),
                 "label_y": float(label_y),
                 "segments": [],
@@ -768,6 +772,7 @@ def build_overlay_scene(
 
     show_dso_markers = overlay_layer_enabled(overlay_options, "deep_sky_markers")
     show_dso_labels = overlay_layer_enabled(overlay_options, "deep_sky_labels")
+    detailed_labels = bool(overlay_detail_value(overlay_options, "detailed_dso_labels"))
     show_constellation_labels = overlay_layer_enabled(overlay_options, "constellation_labels")
     show_contextual_labels = overlay_layer_enabled(overlay_options, "contextual_constellation_labels")
     show_star_markers = overlay_layer_enabled(overlay_options, "star_markers")
@@ -884,6 +889,10 @@ def build_overlay_scene(
         scene["deep_sky_labels"].append(
             {
                 "text": item["display_label"],
+                "key": item.get("label_key"),
+                "messier": item.get("messier"),
+                "catalog_id": item.get("catalog_id"),
+                "detailed": bool(detailed_labels),
                 "x": float(position[0]),
                 "y": float(position[1]),
                 "font_size": dso_font_size,
@@ -936,6 +945,7 @@ def build_overlay_scene(
             scene["constellation_labels"].append(
                 {
                     "text": constellation["display_name"],
+                    "key": constellation.get("resource_key"),
                     "x": float(position[0]),
                     "y": float(position[1]),
                     "font_size": constellation_font_size,
@@ -998,6 +1008,7 @@ def build_overlay_scene(
         scene["star_labels"].append(
             {
                 "text": star["name"],
+                "key": star.get("name_key"),
                 "x": float(position[0]),
                 "y": float(position[1]),
                 "font_size": star_font_size,
